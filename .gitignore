@@ -1,2 +1,114 @@
-__pycache__/
+# ===== Sensitive data: never commit =====
+
+# env files with real values (examples are kept)
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+*.cer
+*.der
+*.csr
+*.keytab
+id_rsa*
+id_ed25519*
+id_ecdsa*
+*.ppk
+*.gpg
+*.asc
+
+# tokens, passwords, credential files
+*secret*
+*password*
+*passwd*
+*credential*
+*token*
+*api-key*
+*api_key*
+*apikey*
+.netrc
+.pgpass
+.my.cnf
+cookies.txt
+*.cookies
+.htpasswd
+
+# Terraform state and variables (state holds secrets in plain text)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+*.tfplan
+
+# Ansible
+*.retry
+.vault_pass*
+vault_pass*
+.ansible/
+
+# local configs with real hosts/credentials (examples are kept)
 *.conf
+!*.conf.example
+*.local
+*.local.*
+
+# VPN / WireGuard / Kerberos
+*.ovpn
+wg*.conf
+*.ccache
+krb5cc_*
+
+# dumps, backups, databases, captures
+*.sql.gz
+*.dump
+*.backup
+*.bak
+*.bak-*
+*.orig
+*.rsc.bak
+*.db
+*.sqlite
+*.sqlite3
+*.pcap
+*.pcapng
+*.har
+
+# logs and runtime output
+*.log
+*.jsonl
+*.err
+
+# Python / Node
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ===== Repo-specific =====
