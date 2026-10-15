@@ -1,0 +1,206 @@
+#!/usr/bin/python3 -I
+"""Append the company footer to an outgoing message. Drop-in replacement for altermime in amavis:
+
+    $altermime = '/usr/local/bin/mail-disclaimer';
+    @altermime_args_disclaimer = qw(--disclaimer=/etc/amavis/disclaimer/_OPTION_.txt
+                                    --disclaimer-html=/etc/amavis/disclaimer/_OPTION_.html);
+
+amavis runs it as:  mail-disclaimer --input=<message file> --disclaimer=<txt> --disclaimer-html=<html>
+and reads the message file back afterwards.
+
+Why not altermime: for quoted-printable bodies it writes the whole footer as one line (newlines become
+=0A), Postfix cuts lines at 998 bytes and that destroys letters; it also skips base64 bodies and crashes
+on a missing or empty footer file.
+
+Rules:
+  * Only the message's own text/plain and text/html body get the footer. Attachments, forwarded
+    messages and everything else are written back byte for byte.
+  * Each body is decoded, the footer appended (HTML: before </body>), and encoded again the way it was
+    (base64 stays base64, anything else becomes properly wrapped quoted-printable, or stays 8bit/7bit
+    when it fits).
+  * Signed or encrypted mail is left alone.
+  * On any doubt the message is left untouched and the exit code is 0: a missing footer is better than
+    a damaged or undelivered message. Reasons go to syslog (mail.info, tag mail-disclaimer).
+"""
+import base64
+import email
+import email.policy
+import os
+import quopri
+import re
+import sys
+import syslog
+import tempfile
+
+MAX_LINE = 900  # bytes; SMTP allows 998
+
+
+class Verbatim(email.policy.Compat32):
+    """Headers are kept exactly as they arrived (the stock policy re-folds them, which changes bytes)."""
+
+    def header_source_parse(self, sourcelines):
+        name, value = sourcelines[0].split(':', 1)
+        return (name, (value + ''.join(sourcelines[1:])).rstrip('\r\n'))
+
+    def header_store_parse(self, name, value):
+        return (name, ' ' + value)
+
+    def header_fetch_parse(self, name, value):
+        # readers (get_payload, get_content_type, ...) must not see the kept leading blank
+        return super().header_fetch_parse(name, value.lstrip(' \t'))
+
+    def fold(self, name, value):
+        return name + ':' + value + self.linesep
+
+    def fold_binary(self, name, value):
+        return (name + ':' + value).encode('ascii', 'surrogateescape') + self.linesep.encode('ascii')
+
+
+def log(msg):
+    try:
+        syslog.openlog('mail-disclaimer', syslog.LOG_PID, syslog.LOG_MAIL)
+        syslog.syslog(syslog.LOG_INFO, msg)
+    except Exception:
+        pass
+
+
+def read_footer(path):
+    if not path or not os.path.isfile(path):
+        return None
+    text = open(path, 'rb').read().decode('utf-8-sig').replace('\r\n', '\n').strip('\n')
+    return text or None
+
+
+def body_parts(msg):
+    """The message's own text/plain and text/html parts (not attachments, not nested messages)."""
+    ctype = msg.get_content_type()
+    if ctype in ('text/plain', 'text/html'):
+        disp = (msg.get('Content-Disposition') or '').strip().lower()
+        if disp.startswith('attachment') or msg.get_filename():
+            return []
+        return [msg]
+    if not msg.is_multipart():
+        return []
+    kids = [k for k in msg.get_payload() if hasattr(k, 'get_content_type')]
+    if ctype == 'multipart/alternative':
+        found = []
+        for k in kids:
+            found += body_parts(k)
+        return found
+    if ctype in ('multipart/mixed', 'multipart/related') and kids:
+        return body_parts(kids[0])  # the body is the first part; the rest are attachments/images
+    return []
+
+
+def add_footer(part, footer, is_html):
+    """Returns True if the part was changed."""
+    cte = (part.get('Content-Transfer-Encoding') or '7bit').strip().lower()
+    if cte not in ('7bit', '8bit', 'binary', 'quoted-printable', 'base64'):
+        return False
+    charset = (part.get_content_charset() or 'us-ascii').lower()
+    raw = part.get_payload(decode=True)
+    if raw is None:
+        return False
+    try:
+        text = raw.decode(charset)
+    except (LookupError, UnicodeDecodeError):
+        return False
+    text = text.replace('\r\n', '\n')
+
+    if is_html:
+        m = None
+        for m in re.finditer(r'</body\s*>', text, re.I):
+            pass
+        block = '\n<br>\n' + footer + '\n'
+        text = (text[:m.start()] + block + text[m.start():]) if m else (text.rstrip('\n') + block)
+    else:
+        text = text.rstrip('\n') + '\n\n' + footer + '\n'
+
+    try:
+        data = text.encode(charset)
+    except UnicodeEncodeError:
+        charset = 'utf-8'
+        data = text.encode(charset)
+
+    ascii_only = all(b < 128 for b in data)
+    short = all(len(line) <= MAX_LINE for line in data.split(b'\n'))
+    if cte == 'base64':
+        new_cte, payload = 'base64', base64.encodebytes(data)
+    elif cte in ('8bit', 'binary') and short:
+        new_cte, payload = cte, data
+    elif cte == '7bit' and ascii_only and short:
+        new_cte, payload = '7bit', data
+    else:
+        new_cte, payload = 'quoted-printable', quopri.encodestring(data)
+
+    part.set_payload(payload.decode('ascii', 'surrogateescape'))
+    if 'Content-Transfer-Encoding' in part:
+        part.replace_header('Content-Transfer-Encoding', new_cte)
+    else:
+        part['Content-Transfer-Encoding'] = new_cte
+    if (part.get_content_charset() or '').lower() != charset:
+        part.set_param('charset', charset)
+    return True
+
+
+def main(argv):
+    opt = {}
+    for a in argv:
+        if a.startswith('--') and '=' in a:
+            k, v = a[2:].split('=', 1)
+            opt[k] = v
+    path = opt.get('input')
+    if not path:
+        return 0
+    txt = read_footer(opt.get('disclaimer'))
+    html = read_footer(opt.get('disclaimer-html'))
+    if not txt and not html:
+        return 0  # no footer configured for this sender
+
+    original = open(path, 'rb').read()
+    linesep = '\r\n' if b'\r\n' in original[:4000] else '\n'
+    policy = Verbatim(linesep=linesep, max_line_length=0, mangle_from_=False)
+    msg = email.message_from_bytes(original, policy=policy)
+
+    # Only touch messages this parser writes back unchanged, so nothing but the body can differ.
+    if msg.as_bytes(policy=policy) != original:
+        log('skipped: message does not round-trip (%d bytes)' % len(original))
+        return 0
+    for part in msg.walk():
+        if part.get_content_type() in ('multipart/signed', 'multipart/encrypted',
+                                       'application/pkcs7-mime', 'application/x-pkcs7-mime'):
+            log('skipped: signed or encrypted')
+            return 0
+
+    changed = 0
+    for part in body_parts(msg):
+        is_html = part.get_content_type() == 'text/html'
+        footer = html if is_html else txt
+        if footer and add_footer(part, footer, is_html):
+            changed += 1
+    if not changed:
+        log('skipped: no text body to extend')
+        return 0
+
+    out = msg.as_bytes(policy=policy)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or '.', prefix='.mail-disclaimer-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(out)
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:  # never fail the mail because of a footer
+        log('error, message left unchanged: %r' % (e,))
+        sys.exit(0)

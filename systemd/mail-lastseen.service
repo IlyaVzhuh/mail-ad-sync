@@ -1,0 +1,7 @@
+[Unit]
+Description=Record newest login per mailbox (mailbox_lastseen)
+After=mariadb.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mail-lastseen

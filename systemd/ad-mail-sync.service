@@ -1,0 +1,7 @@
+[Unit]
+Description=AD corp.example.com -> mail.example.com mailbox sync (mode from /etc/ad-mail-sync.conf)
+After=mariadb.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ad-mail-sync

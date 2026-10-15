@@ -1,0 +1,18 @@
+# /etc/ad-mail-sync.conf  (root:root 0600)
+[ldap]
+# space-separated list of DCs, tried in order (LDAPS 636)
+hosts = dc1.corp.example.com dc2.corp.example.com
+user = svc-mail@corp.example.com
+password = CHANGE_ME
+base = DC=corp,DC=example,DC=com
+
+[mail]
+default_domain = example.com
+domains = example.com example.org
+
+[sync]
+# link = write ad_user only (safe). enforce = also create new mailboxes + block AD-disabled.
+mode = link
+max_blocks = 10
+# sAMAccountNames that never get an auto-created mailbox (space-separated)
+no_create = vpn-phone

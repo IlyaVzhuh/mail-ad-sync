@@ -1,0 +1,9 @@
+[Unit]
+Description=Run mail-lastseen hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

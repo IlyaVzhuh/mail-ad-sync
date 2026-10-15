@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""mail-lastseen — record the newest login per mailbox in postfix.mailbox_lastseen.
+
+Sources: dovecot "imap-login/pop3-login: Login: user=<…>" (IMAP, POP, Roundcube, Kerberos)
+and postfix "sasl_username=…" (send-only accounts). Reads the journal incrementally from a
+saved cursor; --backfill reads the whole journal plus /var/log/mail.log*.
+"""
+import argparse, datetime as dt, glob, gzip, re, subprocess, sys
+import pymysql
+
+CURSOR = "/var/lib/mail-lastseen.cursor"
+RX = re.compile(r"(?:(imap|pop3)-login: Login: user=<([^>]+)>|sasl_username=([^,\s]+))")
+MONTHS = {m: i for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split(), 1)}
+
+
+def journal(backfill):
+    cmd = ["journalctl", "-u", "dovecot", "-u", "postfix@-", "-o", "short-iso", "--no-pager", "-q",
+           "--show-cursor"]
+    if not backfill:
+        try:
+            cmd += ["--after-cursor", open(CURSOR).read().strip()]
+        except FileNotFoundError:
+            cmd += ["--since", "-1d"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, errors="replace")
+    cursor = None
+    for line in p.stdout:
+        if line.startswith("-- cursor: "):
+            cursor = line[11:].strip()
+            continue
+        m = RX.search(line)
+        if m:
+            ts = dt.datetime.fromisoformat(line[:19])
+            yield ts, m
+    p.wait()
+    if cursor:
+        open(CURSOR, "w").write(cursor + "\n")
+
+
+def maillogs():
+    year = dt.date.today().year
+    for f in sorted(glob.glob("/var/log/mail.log*")):
+        op = gzip.open if f.endswith(".gz") else open
+        with op(f, "rt", errors="replace") as fh:
+            for line in fh:
+                m = RX.search(line)
+                if not m:
+                    continue
+                mon, day, t = line[:3], int(line[4:6]), line[7:15]
+                ts = dt.datetime(year, MONTHS[mon], day, *map(int, t.split(":")))
+                if ts > dt.datetime.now() + dt.timedelta(days=1):
+                    ts = ts.replace(year=year - 1)
+                yield ts, m
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--backfill", action="store_true")
+    args = ap.parse_args()
+    newest = {}
+    srcs = [journal(args.backfill)] + ([maillogs()] if args.backfill else [])
+    for src in srcs:
+        for ts, m in src:
+            user = (m.group(2) or m.group(3)).lower()
+            source = m.group(1) or "smtp"
+            if user not in newest or ts > newest[user][0]:
+                newest[user] = (ts, source)
+    db = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root", database="postfix")
+    with db.cursor() as cur:
+        cur.execute("SELECT username FROM mailbox")
+        valid = {r[0].lower() for r in cur.fetchall()}
+        # Kerberos logins without authz id show up under the linked mailbox name (userdb renames them)
+        n = 0
+        for user, (ts, source) in newest.items():
+            if user not in valid:
+                continue
+            cur.execute("INSERT INTO mailbox_lastseen (username, last_login, source) VALUES (%s,%s,%s) "
+                        "ON DUPLICATE KEY UPDATE source = IF(VALUES(last_login) > last_login, VALUES(source), source), "
+                        "last_login = GREATEST(last_login, VALUES(last_login))", (user, ts, source))
+            n += 1
+    db.commit()
+    print(f"mail-lastseen: {len(newest)} users seen, {n} mailboxes updated")
+
+
+if __name__ == "__main__":
+    main()

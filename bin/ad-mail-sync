@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""ad-mail-sync — keep mail.example.com mailboxes in step with AD corp.example.com.
+
+Modes (config [sync] mode, or --mode):
+  link     write/refresh postfix.ad_user only. Creates and blocks nothing. (default)
+  enforce  link + create mailboxes for new AD users + login-block AD-disabled users.
+
+Rules (see README.md):
+  * AD user <-> mailbox link: exactly one existing mailbox among
+    sam@example.com, sam@example.org, AD `mail`; and no other AD user claims it. Else: report only.
+  * Existing links are keyed by objectGUID and survive renames.
+  * enforce/create: enabled, givenName AND sn set, whenCreated after the first sync run,
+    no matching mailbox -> sam@<default_domain>, name = displayName.
+  * enforce/block: linked user disabled in AD (UAC 0x2) or gone from AD ->
+    mailbox_block(reason='ad_disabled'). Mail is still delivered. Re-enabled -> unblocked.
+  * Never deletes mailboxes. Never touches mailboxes that are not linked.
+  * Brakes: abort on 0 AD users or a >20% drop vs last run; abort if one run would block
+    more than max_blocks, unless --allow-mass-block (one-time, for the first enforce run).
+"""
+import argparse, configparser, datetime as dt, logging, secrets, ssl, string, subprocess, sys
+import pymysql
+from ldap3 import Server, Connection, Tls, SUBTREE
+
+CONF = "/etc/ad-mail-sync.conf"
+PFA_CLI = "/var/www/html/postfixadmin/scripts/postfixadmin-cli"
+UAC_DISABLED = 0x2
+log = logging.getLogger("ad-mail-sync")
+
+
+def ldap_users(cfg):
+    tls = Tls(validate=ssl.CERT_NONE)
+    last = None
+    for host in cfg["ldap"]["hosts"].split():
+        try:
+            c = Connection(Server(host, port=636, use_ssl=True, tls=tls, connect_timeout=5),
+                           user=cfg["ldap"]["user"], password=cfg["ldap"]["password"],
+                           auto_bind=True, receive_timeout=30)
+            break
+        except Exception as e:  # try next DC
+            last = e
+            log.warning("LDAP %s: %s", host, e)
+    else:
+        raise SystemExit(f"no DC reachable: {last}")
+    attrs = ["objectGUID", "sAMAccountName", "mail", "displayName", "givenName", "sn",
+             "userAccountControl", "whenCreated", "distinguishedName"]
+    out = []
+    for e in c.extend.standard.paged_search(cfg["ldap"]["base"], "(&(objectCategory=person)(objectClass=user))",
+                                           SUBTREE, attributes=attrs, paged_size=500, generator=True):
+        if e.get("type") != "searchResEntry":
+            continue
+        a = e["attributes"]
+        sam = a.get("sAMAccountName") or ""
+        if not sam:
+            continue
+        mail = a.get("mail") or ""
+        if isinstance(mail, list):
+            mail = mail[0] if mail else ""
+        created = a.get("whenCreated")
+        out.append({
+            "guid": str(a["objectGUID"]).strip("{}").lower(),
+            "sam": sam, "mail": mail.lower(),
+            "display": a.get("displayName") or "",
+            "given": a.get("givenName") or "", "sn": a.get("sn") or "",
+            "enabled": not (int(a.get("userAccountControl") or 0) & UAC_DISABLED),
+            "created": created.replace(tzinfo=None) if isinstance(created, dt.datetime) else None,
+            "dn": a.get("distinguishedName") or "",
+        })
+    c.unbind()
+    return out
+
+
+def q(db, sql, args=()):
+    with db.cursor() as cur:
+        cur.execute(sql, args)
+        return cur.fetchall()
+
+
+def act(db, dry, user, action, reason, note=""):
+    log.info("%s%s %s (%s) %s", "[dry] " if dry else "", action, user, reason, note)
+    if not dry:
+        q(db, "INSERT INTO mailbox_action_log (at, username, action, reason, note) VALUES (NOW(), %s, %s, %s, %s)",
+          (user, action, reason, note[:255]))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["link", "enforce"])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--allow-mass-block", action="store_true")
+    ap.add_argument("--report", action="store_true", help="print unmatched/conflict lists")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    cfg = configparser.ConfigParser()
+    cfg.read(CONF)
+    mode = args.mode or cfg.get("sync", "mode", fallback="link")
+    dry = args.dry_run
+    domains = cfg.get("mail", "domains", fallback="example.com example.org").split()
+    default_domain = cfg.get("mail", "default_domain", fallback="example.com")
+    max_blocks = cfg.getint("sync", "max_blocks", fallback=10)
+    # sAMAccountNames never auto-created (service accounts like vpn-phone)
+    no_create = {x.lower() for x in cfg.get("sync", "no_create", fallback="").split()}
+
+    ad = ldap_users(cfg)
+    db = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root", database="postfix", autocommit=False)
+    state = dict(q(db, "SELECT k, v FROM ad_sync_state"))
+
+    # brake: AD answer sanity
+    prev = int(state.get("last_ad_count", 0))
+    if not ad or (prev and len(ad) < prev * 0.8):
+        raise SystemExit(f"AD returned {len(ad)} users (last run {prev}); aborting")
+
+    now = dt.datetime.utcnow().replace(microsecond=0)
+    first_run = state.get("first_run")
+    first_run_dt = dt.datetime.fromisoformat(first_run) if first_run else None
+
+    mbox = {r[0].lower(): r[1] for r in q(db, "SELECT username, active FROM mailbox")}
+    links = {r[0]: {"sam": r[1], "username": r[2]} for r in q(db, "SELECT object_guid, sam, username FROM ad_user")}
+    linked_mb = {v["username"] for v in links.values()}
+
+    # candidates for users not yet linked
+    cand, claims = {}, {}
+    for u in ad:
+        if u["guid"] in links:
+            continue
+        c = {f"{u['sam'].lower()}@{d}" for d in domains}
+        if u["mail"]:
+            c.add(u["mail"])
+        c = sorted(x for x in c if x in mbox and x not in linked_mb)
+        cand[u["guid"]] = c
+        for m in c:
+            claims.setdefault(m, []).append(u["sam"])
+
+    new_links, conflicts, unmatched, to_create = [], [], [], []
+    for u in ad:
+        if u["guid"] in links:
+            continue
+        c = cand[u["guid"]]
+        if len(c) == 1 and len(claims[c[0]]) == 1:
+            new_links.append((u, c[0]))
+        elif c:
+            conflicts.append((u, c))
+        else:
+            is_new = first_run_dt and u["created"] and u["created"] > first_run_dt
+            target = f"{u['sam'].lower()}@{default_domain}"
+            if (mode == "enforce" and is_new and u["enabled"] and u["given"] and u["sn"] and target not in mbox
+                    and u["sam"].lower() not in no_create):
+                to_create.append((u, target))
+            else:
+                unmatched.append(u)
+
+    # --- create (enforce only)
+    for u, target in to_create:
+        name = u["display"] or f"{u['given']} {u['sn']}"
+        pw = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(24))
+        act(db, dry, target, "create", "ad_new_user", f"sam={u['sam']} name={name}")
+        if not dry:
+            r = subprocess.run([PFA_CLI, "mailbox", "add", target, "--password", pw, "--password2", pw,
+                                "--name", name, "--quota", "0", "--active", "1", "--welcome_mail", "0"],
+                               capture_output=True, text=True)
+            if "has been added" not in r.stdout:
+                log.error("create %s failed: %s %s", target, r.stdout.strip()[-300:], r.stderr.strip()[-300:])
+                continue
+            mbox[target] = 1
+        new_links.append((u, target))
+
+    # --- write links (all modes)
+    by_guid = {u["guid"]: u for u in ad}
+    for u, m in new_links:
+        act(db, dry, m, "link", "ad_match", f"sam={u['sam']}")
+    if not dry:
+        for u, m in new_links:
+            q(db, "INSERT INTO ad_user (object_guid, sam, username, dn, enabled, first_seen, synced_at) "
+                  "VALUES (%s,%s,%s,%s,%s,%s,%s)", (u["guid"], u["sam"], m, u["dn"][:1024], u["enabled"], now, now))
+        for g, l in links.items():
+            u = by_guid.get(g)
+            if u:
+                q(db, "UPDATE ad_user SET sam=%s, dn=%s, enabled=%s, synced_at=%s WHERE object_guid=%s",
+                  (u["sam"], u["dn"][:1024], u["enabled"], now, g))
+            if l["username"] not in mbox:  # mailbox deleted by hand in Postfix Admin
+                act(db, dry, l["username"], "unlink", "mailbox_gone")
+                q(db, "DELETE FROM ad_user WHERE object_guid=%s", (g,))
+
+    # --- block / unblock (enforce only)
+    if mode == "enforce":
+        blocked = {r[0]: r[1] for r in q(db, "SELECT username, reason FROM mailbox_block")}
+        all_links = {g: l["username"] for g, l in links.items()}
+        all_links.update({u["guid"]: m for u, m in new_links})
+        want_block, want_unblock = [], []
+        for g, m in all_links.items():
+            if m not in mbox:
+                continue
+            u = by_guid.get(g)
+            disabled = (u is None) or (not u["enabled"])
+            if disabled and m not in blocked:
+                want_block.append((m, "gone from AD" if u is None else f"sam={u['sam']}"))
+            elif not disabled and blocked.get(m) == "ad_disabled":
+                want_unblock.append(m)
+        if len(want_block) > max_blocks and not args.allow_mass_block:
+            db.rollback()
+            raise SystemExit(f"would block {len(want_block)} > max_blocks={max_blocks}; "
+                             f"re-run with --allow-mass-block if intended")
+        for m, note in want_block:
+            act(db, dry, m, "block", "ad_disabled", note)
+            if not dry:
+                q(db, "INSERT INTO mailbox_block (username, reason, since, note) VALUES (%s,'ad_disabled',%s,%s)",
+                  (m, now, note[:255]))
+        for m in want_unblock:
+            act(db, dry, m, "unblock", "ad_enabled")
+            if not dry:
+                q(db, "DELETE FROM mailbox_block WHERE username=%s AND reason='ad_disabled'", (m,))
+
+    if not dry:
+        if not first_run:
+            q(db, "INSERT INTO ad_sync_state (k, v) VALUES ('first_run', %s)", (now.isoformat(),))
+        q(db, "REPLACE INTO ad_sync_state (k, v) VALUES ('last_ad_count', %s), ('last_run', %s), ('last_mode', %s)",
+          (str(len(ad)), now.isoformat(), mode))
+        db.commit()
+
+    log.info("mode=%s%s ad=%d links_before=%d new_links=%d created=%d conflicts=%d unmatched=%d",
+             mode, " dry-run" if dry else "", len(ad), len(links), len(new_links), len(to_create),
+             len(conflicts), len(unmatched))
+    if args.report:
+        for u, c in conflicts:
+            print(f"CONFLICT\t{u['sam']}\t{','.join(c)}\t{u['dn']}")
+        for u in unmatched:
+            print(f"UNMATCHED\t{u['sam']}\t{u['mail']}\t{'enabled' if u['enabled'] else 'disabled'}\t{u['dn']}")
+
+
+if __name__ == "__main__":
+    main()

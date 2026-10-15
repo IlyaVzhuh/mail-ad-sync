@@ -1,0 +1,15 @@
+# k5principals: Kerberos principals allowed to log in as this mailbox when the client
+# sends the mailbox address as the authorization id (Thunderbird does). Comes from ad_user.
+password_query = SELECT m.password, \
+  (SELECT GROUP_CONCAT(DISTINCT CONCAT(a.sam, '@CORP.EXAMPLE.COM')) FROM ad_user a WHERE a.username = m.username) AS k5principals \
+  FROM mailbox m WHERE m.username = '%u'
+
+# 1st branch: normal lookup (PLAIN logins, LDA delivery) — same result as the old query.
+# 2nd branch: Kerberos login without an authz id arrives as sam@corp.example.com (auth_username_format=%Lu);
+#             map it to the linked mailbox and rename the session to it (user field),
+#             so mail_location (/home/mail/%d/%u/) points at the real maildir.
+user_query = SELECT m.username AS user, 1024 AS uid, 1024 AS gid FROM mailbox m WHERE m.username = '%u' \
+  UNION ALL \
+  SELECT m.username, 1024, 1024 FROM ad_user a JOIN mailbox m ON m.username = a.username \
+  WHERE '%d' = 'corp.example.com' AND a.sam = '%n' \
+  LIMIT 1

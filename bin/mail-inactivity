@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""mail-inactivity — fully disable mailboxes with no use for 365 days.
+
+A mailbox is inactive when ALL hold:
+  * active=1, created more than --days ago, not in /etc/mail-inactivity.exempt
+  * no row in mailbox_lastseen newer than --days
+  * dovecot.index.log in its maildir older than --days (it also changes on delivery,
+    so this means nothing was read AND nothing arrived). Until journal-based tracking
+    covers a full year (from 2026-06-24, i.e. after 2027-06-24) this is the main guard.
+
+Default is a report. --apply disables via postfixadmin-cli (mailbox + its own alias
+become inactive: no login, new mail bounces; data stays on disk).
+Brake: aborts if more than --max would be disabled, unless --allow-mass.
+"""
+import argparse, datetime as dt, os, subprocess, sys
+import pymysql
+
+PFA_CLI = "/var/www/html/postfixadmin/scripts/postfixadmin-cli"
+EXEMPT = "/etc/mail-inactivity.exempt"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--days", type=int, default=365)
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--max", type=int, default=20)
+    ap.add_argument("--allow-mass", action="store_true")
+    args = ap.parse_args()
+    cutoff = dt.datetime.now() - dt.timedelta(days=args.days)
+    exempt = set()
+    if os.path.exists(EXEMPT):
+        exempt = {l.split("#")[0].strip().lower() for l in open(EXEMPT)} - {""}
+    db = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root", database="postfix")
+    with db.cursor() as cur:
+        cur.execute("SELECT m.username, m.domain, m.created, l.last_login FROM mailbox m "
+                    "LEFT JOIN mailbox_lastseen l ON l.username = m.username WHERE m.active = '1'")
+        rows = cur.fetchall()
+    victims = []
+    for user, domain, created, last in rows:
+        if user.lower() in exempt or created > cutoff or (last and last > cutoff):
+            continue
+        idx = f"/home/mail/{domain.lower()}/{user.lower()}/dovecot.index.log"
+        try:
+            mtime = dt.datetime.fromtimestamp(os.stat(idx).st_mtime)
+        except FileNotFoundError:
+            # never opened by any client; fall back to the maildir itself
+            try:
+                mtime = dt.datetime.fromtimestamp(os.stat(os.path.dirname(idx)).st_mtime)
+            except FileNotFoundError:
+                mtime = created
+        if mtime > cutoff:
+            continue
+        victims.append((user, last, mtime))
+    victims.sort(key=lambda v: v[2])
+    for user, last, mtime in victims:
+        print(f"INACTIVE\t{user}\tlast_login={last or '-'}\tindex={mtime:%Y-%m-%d}")
+    print(f"mail-inactivity: {len(victims)} inactive of {len(rows)} active mailboxes (cutoff {cutoff:%Y-%m-%d})")
+    if not args.apply:
+        return
+    if len(victims) > args.max and not args.allow_mass:
+        sys.exit(f"would disable {len(victims)} > --max {args.max}; re-run with --allow-mass if intended")
+    with db.cursor() as cur:
+        for user, last, mtime in victims:
+            r = subprocess.run([PFA_CLI, "mailbox", "update", user, "--active", "0"], capture_output=True, text=True)
+            ok = r.returncode == 0 and "rror" not in r.stdout
+            cur.execute("INSERT INTO mailbox_action_log (at, username, action, reason, note) VALUES (NOW(), %s, %s, %s, %s)",
+                        (user, "disable" if ok else "disable_failed", "inactive_365d",
+                         f"last_login={last or '-'} index={mtime:%Y-%m-%d}"))
+            print(("disabled " if ok else "FAILED ") + user)
+    db.commit()
+
+
+if __name__ == "__main__":
+    main()
